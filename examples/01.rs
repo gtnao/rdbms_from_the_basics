@@ -31,7 +31,7 @@ impl Database {
     fn append(&mut self, value: u8) {
         self.file.seek(SeekFrom::End(0)).unwrap();
         self.file.write_all(&[value]).unwrap();
-        self.file.flush().unwrap();
+        self.file.sync_all().unwrap();
     }
     fn read_all(&mut self) -> Vec<u8> {
         let mut values = Vec::new();
