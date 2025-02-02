@@ -135,7 +135,7 @@ impl Database {
     fn read(&mut self, index: usize) -> u8 {
         let page_id = index / Page::MAX_TUPLE_LENGTH as usize;
         let page = self.page_manager.read_page(page_id as u8);
-        page.read_tuple(index as u8 % PAGE_SIZE as u8)
+        page.read_tuple(index as u8 % Page::MAX_TUPLE_LENGTH)
     }
 }
 
@@ -157,7 +157,7 @@ fn main() {
     println!("  values: {:?}", values);
     println!("last_page_id: {}", database.last_page_id);
     let value = database.read(50);
-    println!("Read index 50");
+    println!("Read index 50(0-based)");
     println!("  value: {:?}", value);
 
     println!("__________________________");

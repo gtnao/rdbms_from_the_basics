@@ -61,7 +61,7 @@ fn main() {
     let values = database.read_all();
     println!("Read all");
     println!("  values: {:?}", values);
-    println!("Read index 1");
+    println!("Read index 1(0-based)");
     let value = database.read(1);
     println!("  value: {:?}", value);
 
