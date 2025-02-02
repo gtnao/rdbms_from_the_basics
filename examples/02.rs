@@ -133,8 +133,8 @@ impl Database {
         values
     }
     fn read(&mut self, index: usize) -> u8 {
-        let page_id = index / Page::MAX_TUPLE_LENGTH as usize;
-        let page = self.page_manager.read_page(page_id as u8);
+        let page_id = (index / Page::MAX_TUPLE_LENGTH as usize) as u8;
+        let page = self.page_manager.read_page(page_id);
         page.read_tuple(index as u8 % Page::MAX_TUPLE_LENGTH)
     }
 }
