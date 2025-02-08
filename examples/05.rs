@@ -307,7 +307,7 @@ impl Database {
         }
         self.buffer_pool_manager.unpin_page(page_id);
     }
-    fn read_all(&mut self) -> Vec<u8> {
+    fn read_all(&mut self, _transaction: &mut Transaction) -> Vec<u8> {
         let mut values = Vec::new();
         let mut page_id = 0;
         loop {
@@ -338,6 +338,8 @@ fn main() {
     prev_example();
     println!("<concurrent_example>");
     concurrent_example();
+    println!("<concurrent_isolation_example>");
+    concurrent_isolation_example();
 }
 
 fn prev_example() {
@@ -353,7 +355,8 @@ fn prev_example() {
     database.commit(&mut transaction);
     println!("Commit\n");
 
-    let values = database.read_all();
+    let mut transaction = database.begin();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}\n", values);
 
@@ -361,13 +364,14 @@ fn prev_example() {
     println!("Start transaction");
     database.insert(&mut transaction, 30);
     println!("Insert 30");
-    let values = database.read_all();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}", values);
     database.abort(&transaction);
     println!("Abort\n");
 
-    let values = database.read_all();
+    let mut transaction = database.begin();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}\n", values);
 
@@ -375,7 +379,7 @@ fn prev_example() {
     println!("Start transaction");
     database.insert(&mut transaction, 40);
     println!("Insert 40");
-    let values = database.read_all();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}", values);
     println!("Not commit and shutdown.\n");
@@ -383,7 +387,8 @@ fn prev_example() {
     println!("______________________");
     println!("Open existing database.");
     let mut database = Database::load("db", 10);
-    let values = database.read_all();
+    let mut transaction = database.begin();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}", values);
 }
@@ -407,7 +412,33 @@ fn concurrent_example() {
     println!("Not commit transaction2 and shutdown.\n");
 
     let mut database = Database::load("db", 10);
-    let values = database.read_all();
+    let mut transaction = database.begin();
+    let values = database.read_all(&mut transaction);
     println!("Read all");
+    println!("  values: {:?}", values);
+}
+
+fn concurrent_isolation_example() {
+    let mut database = Database::init("db", 10);
+
+    println!("______________________");
+    let mut transaction1 = database.begin();
+    println!("Start transaction1");
+    let mut transaction2 = database.begin();
+    println!("Start transaction2");
+
+    database.insert(&mut transaction1, 10);
+    println!("Insert 10 by transaction1");
+    let values = database.read_all(&mut transaction2);
+    println!("Read all by transaction2");
+    println!("  values: {:?}", values);
+
+    database.commit(&mut transaction1);
+    println!("Commit transaction1");
+
+    let mut database = Database::load("db", 10);
+    let mut transaction3 = database.begin();
+    let values = database.read_all(&mut transaction3);
+    println!("Read all by transaction3");
     println!("  values: {:?}", values);
 }

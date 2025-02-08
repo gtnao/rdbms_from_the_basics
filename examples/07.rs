@@ -1,9 +1,14 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Condvar, Mutex, RwLock,
+    },
+    thread,
+    time::Duration,
 };
 
 #[derive(Clone, Debug)]
@@ -393,19 +398,37 @@ impl RecoveryManager {
 
 struct Transaction {
     transaction_id: u8,
+    lock_manager: Arc<LockManager>,
     log_manager: Arc<RwLock<LogManager>>,
     logs: Vec<Log>,
 }
 
 impl Transaction {
-    fn new(transaction_id: u8, log_manager: Arc<RwLock<LogManager>>) -> Self {
+    fn new(
+        transaction_id: u8,
+        lock_manager: Arc<LockManager>,
+        log_manager: Arc<RwLock<LogManager>>,
+    ) -> Self {
         Self {
             transaction_id,
+            lock_manager,
             log_manager,
             logs: Vec::new(),
         }
     }
+    fn pre_read(&mut self, page_id: u8, slot_id: u8) {
+        self.lock_manager.lock(
+            RowID(page_id, slot_id),
+            self.transaction_id,
+            LockType::Shared,
+        );
+    }
     fn log_insert(&mut self, page_id: u8, slot_id: u8, tuple: u8) -> u8 {
+        self.lock_manager.lock(
+            RowID(page_id, slot_id),
+            self.transaction_id,
+            LockType::Exclusive,
+        );
         let log = self
             .log_manager
             .write()
@@ -422,6 +445,11 @@ impl Transaction {
         lsn
     }
     fn log_compensate_insert(&mut self, page_id: u8, slot_id: u8, next_lsn: u8) -> u8 {
+        self.lock_manager.lock(
+            RowID(page_id, slot_id),
+            self.transaction_id,
+            LockType::Exclusive,
+        );
         let log = self
             .log_manager
             .write()
@@ -466,8 +494,169 @@ impl Transaction {
             }));
         self.logs.push(log);
     }
+    fn commit(&mut self) {
+        self.log_commit();
+        self.log_manager.write().unwrap().flush();
+        self.lock_manager.unlock(self.transaction_id);
+    }
+    fn abort(&mut self) {
+        self.log_abort();
+        self.log_manager.write().unwrap().flush();
+        self.lock_manager.unlock(self.transaction_id);
+    }
     fn prev_lsn(&self) -> u8 {
         self.logs.last().unwrap().lsn
+    }
+}
+
+enum LockType {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+struct RowID(u8, u8);
+
+struct LockManager {
+    locks: Mutex<HashMap<RowID, Arc<SharedExclusiveLock>>>,
+    transaction_locks_table: Mutex<HashMap<u8, Vec<(RowID, LockType)>>>,
+}
+
+impl LockManager {
+    fn new() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+            transaction_locks_table: Mutex::new(HashMap::new()),
+        }
+    }
+    fn lock(&self, row_id: RowID, transaction_id: u8, lock_type: LockType) {
+        let lock_obj = {
+            let mut guard = self.locks.lock().unwrap();
+            guard
+                .entry(row_id)
+                .or_insert_with(|| Arc::new(SharedExclusiveLock::new()))
+                .clone()
+        };
+
+        match lock_type {
+            LockType::Shared => lock_obj.lock_shared(transaction_id),
+            LockType::Exclusive => lock_obj.lock_exclusive(transaction_id),
+        }
+
+        let mut table = self.transaction_locks_table.lock().unwrap();
+        table
+            .entry(transaction_id)
+            .or_default()
+            .push((row_id, lock_type));
+    }
+    fn unlock(&self, transaction_id: u8) {
+        let locks_to_release = {
+            let mut table = self.transaction_locks_table.lock().unwrap();
+            table.remove(&transaction_id)
+        };
+
+        if let Some(locks_vec) = locks_to_release {
+            let guard = self.locks.lock().unwrap();
+            for (resource, lock_type) in locks_vec {
+                if let Some(lock_obj) = guard.get(&resource) {
+                    match lock_type {
+                        LockType::Shared => lock_obj.unlock_shared(transaction_id),
+                        LockType::Exclusive => lock_obj.unlock_exclusive(transaction_id),
+                    }
+                }
+            }
+        }
+    }
+}
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct SharedExclusiveLock {
+    state: Mutex<LockState>,
+    condvar: Condvar,
+}
+
+struct LockState {
+    readers: HashSet<u8>,
+    writer: Option<u8>,
+}
+
+impl SharedExclusiveLock {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LockState {
+                readers: HashSet::new(),
+                writer: None,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn lock_shared(&self, transaction_id: u8) {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            match state.writer {
+                Some(w) if w != transaction_id => {
+                    state = self.condvar.wait(state).unwrap();
+                }
+                None if !state.readers.contains(&transaction_id) => {
+                    state.readers.insert(transaction_id);
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn unlock_shared(&self, transaction_id: u8) {
+        let mut state = self.state.lock().unwrap();
+        state.readers.remove(&transaction_id);
+        self.condvar.notify_all();
+    }
+
+    fn lock_exclusive(&self, transaction_id: u8) {
+        let mut state = self.state.lock().unwrap();
+
+        loop {
+            if let Some(current_writer) = state.writer {
+                if current_writer != transaction_id {
+                    state = self.condvar.wait(state).unwrap();
+                    continue;
+                } else {
+                    break;
+                }
+            } else {
+                let has_read_lock = state.readers.contains(&transaction_id);
+                if has_read_lock {
+                    if state.readers.len() > 1 {
+                        state = self.condvar.wait(state).unwrap();
+                        continue;
+                    }
+                    state.readers.clear();
+                    state.writer = Some(transaction_id);
+                    break;
+                } else {
+                    if !state.readers.is_empty() {
+                        state = self.condvar.wait(state).unwrap();
+                        continue;
+                    }
+                    state.writer = Some(transaction_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn unlock_exclusive(&self, transaction_id: u8) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(w) = state.writer {
+            assert_eq!(w, transaction_id);
+            state.writer = None;
+            self.condvar.notify_all();
+        }
     }
 }
 
@@ -497,8 +686,16 @@ impl Page {
     fn tuple_length(&self) -> u8 {
         self.bytes[2]
     }
-    fn read_tuples(&self) -> &[u8] {
-        &self.bytes[Self::HEADER_SIZE..(self.tuple_length() as usize + Self::HEADER_SIZE)]
+    fn read_tuple(&self, tuple_index: u8, transaction: &mut Transaction) -> u8 {
+        transaction.pre_read(self.page_id(), tuple_index);
+        self.bytes[tuple_index as usize + Self::HEADER_SIZE]
+    }
+    fn read_tuples(&self, transaction: &mut Transaction) -> Vec<u8> {
+        let mut result = Vec::new();
+        for i in 0..self.tuple_length() {
+            result.push(self.read_tuple(i, transaction));
+        }
+        result
     }
     fn has_space(&self) -> bool {
         self.tuple_length() < Self::MAX_TUPLE_LENGTH
@@ -698,8 +895,9 @@ impl Replacer {
 struct Database {
     log_manager: Arc<RwLock<LogManager>>,
     buffer_pool_manager: Arc<RwLock<BufferPoolManager>>,
-    current_transaction_id: u8,
-    last_page_id: u8,
+    lock_manager: Arc<LockManager>,
+    current_transaction_id: AtomicU8,
+    last_page_id: AtomicU8,
 }
 
 impl Database {
@@ -712,8 +910,9 @@ impl Database {
                 page_manager,
                 buffer_pool_max_frame_length,
             ))),
-            current_transaction_id: 0,
-            last_page_id: 0,
+            lock_manager: Arc::new(LockManager::new()),
+            current_transaction_id: AtomicU8::new(0),
+            last_page_id: AtomicU8::new(0),
         }
     }
     fn load(file_name: &str, log_file_name: &str, buffer_pool_max_frame_length: usize) -> Self {
@@ -730,22 +929,25 @@ impl Database {
         Self {
             log_manager,
             buffer_pool_manager,
-            current_transaction_id: max_transaction_id + 1,
-            last_page_id,
+            lock_manager: Arc::new(LockManager::new()),
+            current_transaction_id: AtomicU8::new(max_transaction_id + 1),
+            last_page_id: AtomicU8::new(last_page_id),
         }
     }
-    fn begin(&mut self) -> Transaction {
-        let mut transaction =
-            Transaction::new(self.current_transaction_id, self.log_manager.clone());
+    fn begin(&self) -> Transaction {
+        let mut transaction = Transaction::new(
+            self.current_transaction_id.load(Ordering::Relaxed),
+            self.lock_manager.clone(),
+            self.log_manager.clone(),
+        );
         transaction.log_begin();
-        self.current_transaction_id += 1;
+        self.current_transaction_id.fetch_add(1, Ordering::Relaxed);
         transaction
     }
-    fn commit(&mut self, transaction: &mut Transaction) {
-        transaction.log_commit();
-        self.log_manager.write().unwrap().flush();
+    fn commit(&self, transaction: &mut Transaction) {
+        transaction.commit();
     }
-    fn abort(&mut self, transaction: &mut Transaction) {
+    fn abort(&self, transaction: &mut Transaction) {
         let logs = transaction.logs.clone();
         for (i, log) in logs.iter().rev().enumerate() {
             match &log.log_type {
@@ -780,11 +982,10 @@ impl Database {
                 LogType::Abort(_) => {}
             }
         }
-        transaction.log_abort();
-        self.log_manager.write().unwrap().flush();
+        transaction.abort();
     }
-    fn insert(&mut self, transaction: &mut Transaction, tuple: u8) {
-        let page_id = self.last_page_id;
+    fn insert(&self, transaction: &mut Transaction, tuple: u8) {
+        let page_id = self.last_page_id.load(Ordering::Relaxed);
         let page = self.buffer_pool_manager.write().unwrap().read_page(page_id);
         {
             let mut page = page.write().unwrap();
@@ -802,7 +1003,7 @@ impl Database {
                     .write()
                     .unwrap()
                     .unpin_page(new_page_id, true);
-                self.last_page_id = new_page_id;
+                self.last_page_id.store(new_page_id, Ordering::Relaxed);
             }
         }
         self.buffer_pool_manager
@@ -810,20 +1011,20 @@ impl Database {
             .unwrap()
             .unpin_page(page_id, true);
     }
-    fn read_all(&mut self, _transaction: &mut Transaction) -> Vec<u8> {
+    fn read_all(&self, transaction: &mut Transaction) -> Vec<u8> {
         let mut values = Vec::new();
         let mut page_id = 0;
         loop {
             let page = self.buffer_pool_manager.write().unwrap().read_page(page_id);
             {
                 let page = page.read().unwrap();
-                values.extend_from_slice(page.read_tuples());
+                values.extend(page.read_tuples(transaction));
             }
             self.buffer_pool_manager
                 .write()
                 .unwrap()
                 .unpin_page(page_id, false);
-            if self.last_page_id > page_id {
+            if self.last_page_id.load(Ordering::Relaxed) > page_id {
                 page_id += 1;
             } else {
                 break;
@@ -849,7 +1050,7 @@ fn main() {
 }
 
 fn prev_example() {
-    let mut database = Database::init("db", "log", 10);
+    let database = Database::init("db", "log", 10);
 
     println!("______________________");
     let mut transaction = database.begin();
@@ -865,6 +1066,7 @@ fn prev_example() {
     let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}\n", values);
+    database.commit(&mut transaction);
 
     let mut transaction = database.begin();
     println!("Start transaction");
@@ -880,6 +1082,7 @@ fn prev_example() {
     let values = database.read_all(&mut transaction);
     println!("Read all");
     println!("  values: {:?}\n", values);
+    database.commit(&mut transaction);
 
     let mut transaction = database.begin();
     println!("Start transaction");
@@ -892,7 +1095,7 @@ fn prev_example() {
 
     println!("______________________");
     println!("Open existing database.");
-    let mut database = Database::load("db", "log", 10);
+    let database = Database::load("db", "log", 10);
     let mut transaction = database.begin();
     let values = database.read_all(&mut transaction);
     println!("Read all");
@@ -900,7 +1103,7 @@ fn prev_example() {
 }
 
 fn concurrent_example() {
-    let mut database = Database::init("db", "log", 10);
+    let database = Database::init("db", "log", 10);
 
     println!("______________________");
     let mut transaction1 = database.begin();
@@ -917,7 +1120,7 @@ fn concurrent_example() {
     println!("Commit transaction1");
     println!("Not commit transaction2 and shutdown.\n");
 
-    let mut database = Database::load("db", "log", 10);
+    let database = Database::load("db", "log", 10);
     let mut transaction = database.begin();
     let values = database.read_all(&mut transaction);
     println!("Read all");
@@ -925,26 +1128,25 @@ fn concurrent_example() {
 }
 
 fn concurrent_isolation_example() {
-    let mut database = Database::init("db", "log", 10);
+    let database = Arc::new(Database::init("db", "log", 10));
 
     println!("______________________");
-    let mut transaction1 = database.begin();
-    println!("Start transaction1");
+    let database_clone = database.clone();
+    thread::spawn(move || {
+        let mut transaction1 = database_clone.begin();
+        println!("Start transaction1");
+        database_clone.insert(&mut transaction1, 10);
+        println!("Insert 10 by transaction1");
+        println!("Sleep 3 seconds(transaction1)");
+        thread::sleep(Duration::from_secs(3));
+        database_clone.commit(&mut transaction1);
+        println!("Commit transaction1");
+    });
     let mut transaction2 = database.begin();
     println!("Start transaction2");
-
-    database.insert(&mut transaction1, 10);
-    println!("Insert 10 by transaction1");
+    thread::sleep(Duration::from_secs(1));
+    println!("Try to read all by transaction2");
     let values = database.read_all(&mut transaction2);
     println!("Read all by transaction2");
-    println!("  values: {:?}", values);
-
-    database.commit(&mut transaction1);
-    println!("Commit transaction1");
-
-    let mut database = Database::load("db", "log", 10);
-    let mut transaction3 = database.begin();
-    let values = database.read_all(&mut transaction3);
-    println!("Read all by transaction3");
     println!("  values: {:?}", values);
 }
