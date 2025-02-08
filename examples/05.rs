@@ -406,6 +406,7 @@ fn concurrent_example() {
     println!("Commit transaction1");
     println!("Not commit transaction2 and shutdown.\n");
 
+    let mut database = Database::load("db", 10);
     let values = database.read_all();
     println!("Read all");
     println!("  values: {:?}", values);
