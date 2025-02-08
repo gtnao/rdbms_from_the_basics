@@ -237,7 +237,6 @@ impl RecoveryManager {
 
     fn run(&mut self) -> u8 {
         let logs = self.log_manager.write().unwrap().read();
-        println!("logs: {:?}", logs);
         self.analyze(&logs);
         self.redo(&logs);
         self.undo(&logs);
